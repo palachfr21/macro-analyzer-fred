@@ -21,7 +21,7 @@ except ImportError:
 
 try:
     import statsmodels.api as sm
-    from statsmodels.tsa.stattools import adfuller
+    from statsmodels.tsa.stattools import adfuller, grangercausalitytests
     STATSMODELS_AVAILABLE = True
 except ImportError:
     STATSMODELS_AVAILABLE = False
@@ -213,6 +213,42 @@ hr { border-color: var(--border) !important; opacity: 0.6 !important; }
 .adf-ok   { color: var(--accent-soft); }
 .adf-fail { color: var(--accent-warn); }
 .adf-na   { color: var(--text-muted); }
+
+/* ── Granger causality block (matches ADF styling) ── */
+.granger-row {
+    display: flex;
+    gap: 12px;
+    margin: 12px 0 8px 0;
+}
+.granger-cell {
+    flex: 1;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 14px 18px;
+}
+.granger-cell .granger-direction {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+.granger-cell .granger-verdict {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.95rem;
+    font-weight: 500;
+    margin-bottom: 4px;
+}
+.granger-cell .granger-meta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+}
+.granger-causes    { color: var(--accent-soft); }
+.granger-nocause   { color: var(--text-muted); }
+.granger-warn      { color: var(--accent-warn); }
 
 /* ── Section labels ── */
 .section-label {
@@ -573,6 +609,60 @@ def adf_test(series):
                 "stationary": None, "n": len(clean)}
 
 
+def granger_test(cause, effect, max_lag=4):
+    """
+    Granger causality test: does `cause` Granger-cause `effect`?
+    H0: `cause` does NOT Granger-cause `effect`.
+    Reject H0 (i.e. conclude Granger-causality) when p-value < 0.05.
+
+    Statsmodels expects a 2-column array where the FIRST column is the
+    series being predicted (effect) and the SECOND column is the
+    candidate causal series (cause).
+
+    Returns the minimum p-value across all tested lags (1..max_lag)
+    using the F-test from the SSR-based test, along with the lag
+    that achieved it and a per-lag breakdown.
+    """
+    df_test = pd.concat([effect, cause], axis=1).dropna()
+    n = len(df_test)
+    # Need enough observations to estimate the unrestricted model
+    if n < (max_lag * 3 + 10) or not STATSMODELS_AVAILABLE:
+        return {"min_pvalue": np.nan, "best_lag": None,
+                "causes": None, "per_lag": [], "n": n}
+
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            results = grangercausalitytests(
+                df_test.values, maxlag=max_lag, verbose=False
+            )
+
+        per_lag = []
+        for lag, res in results.items():
+            # ssr_ftest returns (F, p, df_denom, df_num)
+            p = float(res[0]["ssr_ftest"][1])
+            f = float(res[0]["ssr_ftest"][0])
+            per_lag.append({"lag": int(lag), "pvalue": p, "fstat": f})
+
+        if not per_lag:
+            return {"min_pvalue": np.nan, "best_lag": None,
+                    "causes": None, "per_lag": [], "n": n}
+
+        best = min(per_lag, key=lambda d: d["pvalue"])
+        return {
+            "min_pvalue": best["pvalue"],
+            "best_lag": best["lag"],
+            "best_fstat": best["fstat"],
+            "causes": bool(best["pvalue"] < 0.05),
+            "per_lag": per_lag,
+            "n": n,
+        }
+    except Exception:
+        return {"min_pvalue": np.nan, "best_lag": None,
+                "causes": None, "per_lag": [], "n": n}
+
+
 def significance_label(p):
     if np.isnan(p): return "n/a"
     if p < 0.001: return "p < 0.001 (***)"
@@ -878,12 +968,23 @@ with st.sidebar:
     # ── Parameters ──
     st.markdown('<div class="section-label">Parameters</div>', unsafe_allow_html=True)
 
+    today = datetime.today().date()
+
     col_d1, col_d2 = st.columns(2)
     with col_d1:
-        start_date = st.date_input("Start", value=datetime(2000, 1, 1),
-                                   min_value=datetime(1950, 1, 1))
+        start_date = st.date_input(
+            "Start", value=datetime(2000, 1, 1).date(),
+            min_value=datetime(1947, 1, 1).date(),
+            max_value=today,
+            help="Earliest observation date. FRED coverage begins in 1947 for most series.",
+        )
     with col_d2:
-        end_date = st.date_input("End", value=datetime.today())
+        end_date = st.date_input(
+            "End", value=today,
+            min_value=datetime(1947, 1, 1).date(),
+            max_value=today,
+            help="Latest observation date. Capped at today (no future data).",
+        )
 
     lag = st.slider("Lag (months)", -24, 24, 0, 1,
                     help="Shift A relative to B. Positive lag tests whether A leads B.")
@@ -891,6 +992,12 @@ with st.sidebar:
     auto_resample = st.checkbox("Auto-resample to lower frequency", value=True)
     show_recessions = st.checkbox("Show NBER recession shading", value=True,
                                   help="Overlays grey bands for NBER-dated US recessions.")
+
+    granger_max_lag = st.slider(
+        "Granger max lag", 1, 12, 4, 1,
+        help="Maximum lag tested in the Granger causality test. "
+             "The reported p-value is the minimum across all lags 1..L.",
+    )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -928,6 +1035,15 @@ if not api_key:
     st.stop()
 
 
+# ── Date range validation ──
+if start_date >= end_date:
+    st.markdown(
+        '<div class="note">Start date must be before end date.</div>',
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+
 # ── Fetch data ──
 with st.spinner(f"Fetching {series_id_a}…"):
     try:
@@ -946,6 +1062,19 @@ with st.spinner(f"Fetching {series_id_b}…"):
     except Exception as e:
         st.error(f"Could not fetch {series_id_b}: {e}")
         st.stop()
+
+# ── Inform the user when requested range exceeds actual data coverage ──
+effective_start = max(raw_a.index.min(), raw_b.index.min())
+effective_end = min(raw_a.index.max(), raw_b.index.max())
+requested_start = pd.Timestamp(start_date)
+
+if effective_start > requested_start:
+    st.markdown(
+        f'<div class="note">Effective start: {effective_start.date()}. '
+        f'Requested {start_date} but earliest common observation for '
+        f'{series_id_a} / {series_id_b} is {effective_start.date()}.</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ── Transform ──
@@ -1048,14 +1177,131 @@ st.markdown(adf_html, unsafe_allow_html=True)
 
 # Sober interpretation note when at least one series fails the test
 if (adf_a.get("stationary") is False) or (adf_b.get("stationary") is False):
-    st.markdown("""
-    <div class="note">
-        At least one transformed series fails the ADF test (H₀: unit root, not rejected at the
-        5% level). The Pearson r reported above may reflect spurious correlation between
-        non-stationary processes (Yule, 1926). Consider re-running with a stronger transform
-        (e.g. Difference or YoY) or proceeding with caution when interpreting causality.
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="note">At least one transformed series fails the ADF test '
+        '(H₀: unit root, not rejected at the 5% level). The Pearson r reported '
+        'above may reflect spurious correlation between non-stationary processes '
+        '(Yule, 1926). Consider re-running with a stronger transform (e.g. '
+        'Difference or YoY) or proceeding with caution when interpreting '
+        'causality.</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ── Granger causality tests (both directions) ──
+granger_ab = granger_test(df[label_a], df[label_b], max_lag=granger_max_lag)
+granger_ba = granger_test(df[label_b], df[label_a], max_lag=granger_max_lag)
+
+both_stationary = (adf_a.get("stationary") is True) and (adf_b.get("stationary") is True)
+
+def format_granger_cell(cause_id, effect_id, result, valid):
+    """
+    Render one direction of the Granger causality test.
+    `valid` is False when the underlying ADF tests indicate non-stationarity,
+    in which case we display the result but flag it as unreliable.
+    """
+    direction = f"{cause_id} → {effect_id}"
+
+    if result["causes"] is None:
+        verdict, cls, meta = "N/A", "granger-nocause", "Insufficient observations"
+    elif result["causes"]:
+        verdict, cls = "Granger-causes", "granger-causes"
+        meta = (f"min p = {result['min_pvalue']:.4f} at lag {result['best_lag']} "
+                f"&nbsp;·&nbsp; n = {result['n']}")
+    else:
+        verdict, cls = "No causality", "granger-nocause"
+        meta = (f"min p = {result['min_pvalue']:.4f} at lag {result['best_lag']} "
+                f"&nbsp;·&nbsp; n = {result['n']}")
+
+    if not valid and result["causes"] is not None:
+        cls = "granger-warn"
+        meta = meta + " &nbsp;·&nbsp; unreliable (non-stationary inputs)"
+
+    return (
+        f'<div class="granger-cell">'
+        f'<div class="granger-direction">{direction}</div>'
+        f'<div class="granger-verdict {cls}">{verdict}</div>'
+        f'<div class="granger-meta">{meta}</div>'
+        f'</div>'
+    )
+
+granger_html = (
+    '<div class="granger-row">'
+    + format_granger_cell(series_id_a, series_id_b, granger_ab, both_stationary)
+    + format_granger_cell(series_id_b, series_id_a, granger_ba, both_stationary)
+    + '</div>'
+)
+st.markdown(granger_html, unsafe_allow_html=True)
+
+# Concise technical interpretation
+if granger_ab["causes"] is not None and granger_ba["causes"] is not None:
+    if granger_ab["causes"] and granger_ba["causes"]:
+        granger_summary = (
+            f"Bidirectional Granger-causality detected (feedback): past values of "
+            f"{series_id_a} help predict {series_id_b} and vice versa."
+        )
+    elif granger_ab["causes"]:
+        granger_summary = (
+            f"Unidirectional Granger-causality: past values of {series_id_a} help "
+            f"predict {series_id_b}, but not the reverse. Consistent with "
+            f"{series_id_a} acting as a leading indicator."
+        )
+    elif granger_ba["causes"]:
+        granger_summary = (
+            f"Unidirectional Granger-causality: past values of {series_id_b} help "
+            f"predict {series_id_a}, but not the reverse. Consistent with "
+            f"{series_id_b} acting as a leading indicator."
+        )
+    else:
+        granger_summary = (
+            f"No Granger-causality detected in either direction at lags 1..{granger_max_lag}. "
+            f"Any observed correlation is contemporaneous rather than predictive."
+        )
+
+    if not both_stationary:
+        granger_summary += (
+            " Note: at least one series is non-stationary per the ADF test; "
+            "Granger results should be interpreted with caution."
+        )
+
+    st.markdown(f'<div class="note">{granger_summary}</div>', unsafe_allow_html=True)
+
+# Per-lag breakdown in an expander (for methodological transparency)
+with st.expander("Granger causality — per-lag breakdown", expanded=False):
+    st.markdown(
+        '<div class="note">F-test p-values for the null hypothesis that the candidate '
+        'causal series does NOT Granger-cause the target. p &lt; 0.05 rejects the null.</div>',
+        unsafe_allow_html=True,
+    )
+
+    col_g1, col_g2 = st.columns(2)
+    with col_g1:
+        st.markdown(
+            f'<div class="section-label">{series_id_a} → {series_id_b}</div>',
+            unsafe_allow_html=True,
+        )
+        if granger_ab["per_lag"]:
+            lag_df_ab = pd.DataFrame(granger_ab["per_lag"])
+            lag_df_ab["pvalue"] = lag_df_ab["pvalue"].map(lambda v: f"{v:.4f}")
+            lag_df_ab["fstat"] = lag_df_ab["fstat"].map(lambda v: f"{v:.3f}")
+            lag_df_ab.columns = ["Lag", "p-value", "F-statistic"]
+            st.dataframe(lag_df_ab, use_container_width=True, hide_index=True)
+        else:
+            st.markdown('<div class="note">No results.</div>', unsafe_allow_html=True)
+
+    with col_g2:
+        st.markdown(
+            f'<div class="section-label">{series_id_b} → {series_id_a}</div>',
+            unsafe_allow_html=True,
+        )
+        if granger_ba["per_lag"]:
+            lag_df_ba = pd.DataFrame(granger_ba["per_lag"])
+            lag_df_ba["pvalue"] = lag_df_ba["pvalue"].map(lambda v: f"{v:.4f}")
+            lag_df_ba["fstat"] = lag_df_ba["fstat"].map(lambda v: f"{v:.3f}")
+            lag_df_ba.columns = ["Lag", "p-value", "F-statistic"]
+            st.dataframe(lag_df_ba, use_container_width=True, hide_index=True)
+        else:
+            st.markdown('<div class="note">No results.</div>', unsafe_allow_html=True)
 
 
 # ── Charts ──
