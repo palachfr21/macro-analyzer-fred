@@ -886,11 +886,20 @@ with st.sidebar:
 
     st.markdown("---")
 
-    api_key = st.text_input(
-        "FRED API Key", type="password",
-        help="Get a free key at fred.stlouisfed.org/docs/api/api_key.html",
-        placeholder="Enter your FRED API key",
-    )
+    # ── FRED API key: prefer st.secrets, fall back to manual entry ──
+    api_key = None
+    try:
+        api_key = st.secrets["FRED_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        pass
+
+    if not api_key:
+        api_key = st.text_input(
+            "FRED API Key", type="password",
+            help="Get a free key at fred.stlouisfed.org/docs/api/api_key.html",
+            placeholder="Enter your FRED API key",
+        )
+
     if api_key:
         st.session_state["fred_api_key"] = api_key
 
