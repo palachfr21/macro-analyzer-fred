@@ -1,0 +1,23 @@
+name: Keep Streamlit Alive
+on:
+  schedule:
+    - cron: '0 */4 * * *' # Lance la visite toutes les 4 heures
+
+jobs:
+  wake_up:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open Streamlit App via Headless Browser
+        run: |
+          npm install puppeteer
+          node -e "
+          const puppeteer = require('puppeteer');
+          (async () => {
+            const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox'] });
+            const page = await browser.newPage();
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+            await page.goto('https://macroterminalfred.streamlit.app/', { waitUntil: 'networkidle2', timeout: 60000 });
+            console.log('Application FRED chargée avec succès.');
+            await browser.close();
+          })();
+          "
